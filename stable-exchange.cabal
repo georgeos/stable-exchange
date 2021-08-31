@@ -1,0 +1,34 @@
+cabal-version:      2.4
+name:               stable-exchange
+version:            0.1.0.0
+synopsis:           Stable exchange: one ada for one token
+license:            NONE
+author:             Jorge Orozco
+maintainer:         jorge.orosan@gmail.com
+
+extra-source-files: CHANGELOG.md
+
+library
+    hs-source-dirs:      src
+    exposed-modules:   StableExchange.MyCurrency
+    build-depends:     aeson
+                     , base ^>=4.14.1.0
+                     , containers
+                     , data-default
+                     , freer-extras
+                     , playground-common
+                     , plutus-contract
+                     , plutus-ledger
+                     , plutus-ledger-api
+                     , plutus-tx-plugin
+                     , plutus-tx
+                     , text
+    default-language: Haskell2010
+    ghc-options:         -Wall -fobject-code -fno-ignore-interface-pragmas -fno-omit-interface-pragmas -fno-strictness -fno-spec-constr -fno-specialise
+
+-- test-suite stable-exchange-test
+--     default-language: Haskell2010
+--     type:             exitcode-stdio-1.0
+--     hs-source-dirs:   test
+--     main-is:          MyLibTest.hs
+--     build-depends:    base ^>=4.14.1.0
