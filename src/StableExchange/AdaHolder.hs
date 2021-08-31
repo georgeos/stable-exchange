@@ -1,5 +1,4 @@
 {-# LANGUAGE DataKinds           #-}
-{-# LANGUAGE NumericUnderscores  #-}
 {-# LANGUAGE DeriveAnyClass      #-}
 {-# LANGUAGE DeriveGeneric       #-}
 {-# LANGUAGE FlexibleContexts    #-}
@@ -33,7 +32,7 @@ import           Ledger.Ada             as Ada
 -- | Script to hold ada
 {-# INLINABLE mkValidator #-}
 mkValidator :: () -> () -> ScriptContext -> Bool
-mkValidator () () _ = True
+mkValidator _ _ _ = True
 
 data Holder
 instance Scripts.ValidatorTypes Holder where
@@ -63,13 +62,14 @@ type GiftSchema =
 
 give :: Integer -> Contract w GiftSchema Text ()
 give amount = do
-    let tx = mustPayToOtherScript valHash (Datum $ PlutusTx.toBuiltinData (0::Integer)) $ Ada.lovelaceValueOf amount
+    let ada = amount * 1000000
+        tx = mustPayToOtherScript valHash (Datum $ PlutusTx.toBuiltinData ()) $ Ada.lovelaceValueOf ada
     ledgerTx <- submitTx tx
     void $ awaitTxConfirmed $ txId ledgerTx
-    logInfo @String $ printf "made a gift of %d lovelace" amount
+    logInfo @String $ printf "made a gift of %d ada" ada
 
-endpoints :: Contract () GiftSchema Text ()
-endpoints = forever
+endpointsHolder :: Contract () GiftSchema Text ()
+endpointsHolder = forever
     $ handleError logError
     $ awaitPromise give'
     where
@@ -78,8 +78,8 @@ endpoints = forever
 -- | Trace
 test1 :: IO ()
 test1 = runEmulatorTraceIO $ do
-    h1 <- activateContractWallet (Wallet 1) endpoints
-    h2 <- activateContractWallet (Wallet 2) endpoints
-    callEndpoint @"give" h1 15_000_000
-    callEndpoint @"give" h2 20_000_000
+    h1 <- activateContractWallet (Wallet 1) endpointsHolder
+    h2 <- activateContractWallet (Wallet 2) endpointsHolder
+    callEndpoint @"give" h1 15
+    callEndpoint @"give" h2 20
     void $ Emulator.waitNSlots 1

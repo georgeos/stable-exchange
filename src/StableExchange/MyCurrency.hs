@@ -27,7 +27,7 @@ import           Ledger.Value           as Value
 import           Prelude                (IO, Show (..), String)
 import           Text.Printf            (printf)
 import           Wallet.Emulator.Wallet
--- import           StableExchange.AdaHolder()
+import           StableExchange.AdaHolder
 
 -- | Onchain code
 
@@ -70,6 +70,9 @@ test = runEmulatorTraceIO $ do
     h2 <- activateContractWallet (Wallet 2) endpoints
     callEndpoint @"mint" h1 15
     callEndpoint @"mint" h2 10
+    void $ Emulator.waitNSlots 1
+    hld1 <- activateContractWallet (Wallet 1) endpointsHolder
+    callEndpoint @"give" hld1 20
     void $ Emulator.waitNSlots 1
     callEndpoint @"mint" h1 5
     void $ Emulator.waitNSlots 1
