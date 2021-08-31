@@ -1,4 +1,5 @@
 {-# LANGUAGE DataKinds           #-}
+{-# LANGUAGE NumericUnderscores  #-}
 {-# LANGUAGE DeriveAnyClass      #-}
 {-# LANGUAGE DeriveGeneric       #-}
 {-# LANGUAGE FlexibleContexts    #-}
@@ -15,7 +16,6 @@ module StableExchange.AdaHolder where
 
 import           Control.Monad          hiding (fmap)
 import           Data.Text              (Text)
-import           Data.Void              (Void)
 import           Plutus.Contract        as Contract
 import           Plutus.Trace.Emulator  as Emulator
 import qualified PlutusTx
@@ -23,42 +23,63 @@ import           PlutusTx.Prelude       hiding (Semigroup(..), unless)
 import           Ledger                 hiding (mint, singleton)
 import           Ledger.Constraints     as Constraints
 import qualified Ledger.Typed.Scripts   as Scripts
-import           Ledger.Value           as Value
-import           Prelude                (IO, Show (..), String)
+import           Prelude                (IO, String)
 import           Text.Printf            (printf)
 import           Wallet.Emulator.Wallet
+import           Ledger.Ada             as Ada
 
 -- | Onchain code
 
 -- | Script to hold ada
 {-# INLINABLE mkValidator #-}
-mkValidator :: PubKeyHash -> () -> () -> ScriptContext -> Bool
-mkValidator pk () () ctx = traceIfFalse "beneficiary's signature missing" signedByBeneficiary
-
-  where
-    info :: TxInfo
-    info = scriptContextTxInfo ctx
-
-    signedByBeneficiary :: Bool
-    signedByBeneficiary = txSignedBy info pk
+mkValidator :: () -> () -> ScriptContext -> Bool
+mkValidator () () _ = True
 
 data Holder
 instance Scripts.ValidatorTypes Holder where
     type instance DatumType Holder = ()
     type instance RedeemerType Holder = ()
 
-typedValidator :: PubKeyHash -> Scripts.TypedValidator Holder
-typedValidator p = Scripts.mkTypedValidator @Holder
-    ($$(PlutusTx.compile [|| mkValidator ||]) `PlutusTx.applyCode` PlutusTx.liftCode p)
-    $$(PlutusTx.compile [|| wrap ||])
-  where
-    wrap = Scripts.wrapValidator @() @()
+typedValidator :: Scripts.TypedValidator Holder
+typedValidator = Scripts.mkTypedValidator @Holder
+        $$(PlutusTx.compile [|| mkValidator ||])
+        $$(PlutusTx.compile [|| wrap ||])
+    where
+        wrap = Scripts.wrapValidator @() @()
 
-validator :: PubKeyHash -> Validator
-validator = Scripts.validatorScript . typedValidator
+validator :: Validator
+validator = Scripts.validatorScript typedValidator
 
-valHash :: PubKeyHash -> Ledger.ValidatorHash
-valHash = Scripts.validatorHash . typedValidator
+valHash :: Ledger.ValidatorHash
+valHash = Scripts.validatorHash typedValidator
 
-scrAddress :: PubKeyHash -> Ledger.Address
-scrAddress = scriptAddress . validator
+scrAddress :: Ledger.Address
+scrAddress = scriptAddress validator
+
+-- | Offchain code
+
+type GiftSchema =
+    Endpoint "give" Integer
+
+give :: Integer -> Contract w GiftSchema Text ()
+give amount = do
+    let tx = mustPayToOtherScript valHash (Datum $ PlutusTx.toBuiltinData (0::Integer)) $ Ada.lovelaceValueOf amount
+    ledgerTx <- submitTx tx
+    void $ awaitTxConfirmed $ txId ledgerTx
+    logInfo @String $ printf "made a gift of %d lovelace" amount
+
+endpoints :: Contract () GiftSchema Text ()
+endpoints = forever
+    $ handleError logError
+    $ awaitPromise give'
+    where
+        give' = endpoint @"give" give
+
+-- | Trace
+test1 :: IO ()
+test1 = runEmulatorTraceIO $ do
+    h1 <- activateContractWallet (Wallet 1) endpoints
+    h2 <- activateContractWallet (Wallet 2) endpoints
+    callEndpoint @"give" h1 15_000_000
+    callEndpoint @"give" h2 20_000_000
+    void $ Emulator.waitNSlots 1

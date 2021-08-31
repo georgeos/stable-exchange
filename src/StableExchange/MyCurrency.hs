@@ -27,7 +27,7 @@ import           Ledger.Value           as Value
 import           Prelude                (IO, Show (..), String)
 import           Text.Printf            (printf)
 import           Wallet.Emulator.Wallet
-import           StableExchange.AdaHolder()
+-- import           StableExchange.AdaHolder()
 
 -- | Onchain code
 

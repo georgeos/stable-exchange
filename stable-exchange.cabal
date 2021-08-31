@@ -11,6 +11,7 @@ extra-source-files: CHANGELOG.md
 library
     hs-source-dirs:      src
     exposed-modules:   StableExchange.MyCurrency
+                     , StableExchange.AdaHolder
     build-depends:     aeson
                      , base ^>=4.14.1.0
                      , containers
