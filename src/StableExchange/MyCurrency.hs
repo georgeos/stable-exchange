@@ -25,16 +25,55 @@ import           Ledger.Constraints     as Constraints
 import qualified Ledger.Typed.Scripts   as Scripts
 import           Ledger.Value           as Value
 import           Prelude                (IO, Show (..), String)
+import           GHC.Base               ((<>))
 import           Text.Printf            (printf)
 import           Wallet.Emulator.Wallet
-import           StableExchange.AdaHolder
+import           Ledger.Ada             as Ada
 
 -- | Onchain code
+
+-- | Script to hold ada
+{-# INLINABLE mkValidator #-}
+mkValidator :: () -> () -> ScriptContext -> Bool
+mkValidator _ _ _ = True
+
+data Holder
+instance Scripts.ValidatorTypes Holder where
+    type instance DatumType Holder = ()
+    type instance RedeemerType Holder = ()
+
+typedValidator :: Scripts.TypedValidator Holder
+typedValidator = Scripts.mkTypedValidator @Holder
+        $$(PlutusTx.compile [|| mkValidator ||])
+        $$(PlutusTx.compile [|| wrap ||])
+    where
+        wrap = Scripts.wrapValidator @() @()
+
+validator :: Validator
+validator = Scripts.validatorScript typedValidator
+
+valHash :: Ledger.ValidatorHash
+valHash = Scripts.validatorHash typedValidator
+
+scrAddress :: Ledger.Address
+scrAddress = scriptAddress validator
 
 -- | Minting policy for MyCurrency
 {-# INLINABLE mkPolicy #-}
 mkPolicy :: TokenName -> ScriptContext -> Bool
-mkPolicy r _ = traceIfFalse "Wrong TokenName" (r == TokenName "MyCoin")
+mkPolicy r ctx =
+    let
+        info :: TxInfo
+        info = scriptContextTxInfo ctx
+
+        inputsInfo :: [TxInInfo]
+        inputsInfo = txInfoInputs info
+
+        adaHolder :: Maybe TxInInfo
+        adaHolder = Just (PlutusTx.Prelude.head [ input | input <- inputsInfo, txOutAddress (txInInfoResolved input) == scrAddress ])
+    in 
+    traceIfFalse "Wrong TokenName" (r == TokenName "MyCoin") &&
+    traceIfFalse "Hasn't been deposited" (isJust adaHolder)
 
 policy :: Scripts.MintingPolicy 
 policy = mkMintingPolicyScript $$(PlutusTx.compile [|| Scripts.wrapMintingPolicy mkPolicy ||])
@@ -51,7 +90,7 @@ mint :: Integer -> Contract w MintSchema Text ()
 mint amount = do
     let tn = "MyCoin"
         val = Value.singleton mySymbol tn amount
-        lookups = Constraints.mintingPolicy policy
+        lookups = Constraints.mintingPolicy policy <> Constraints.otherScript validator
         tx      = Constraints.mustMintValueWithRedeemer (Redeemer $ PlutusTx.toBuiltinData (tn::TokenName))  val
     ledgerTx <- submitTxConstraintsWith @Void lookups tx
     void $ awaitTxConfirmed $ txId ledgerTx
@@ -62,6 +101,25 @@ endpoints = forever
         $ handleError logError
         $ awaitPromise mint'
     where mint' = endpoint @"mint" mint
+
+
+type GiftSchema =
+    Endpoint "give" Integer
+
+give :: Integer -> Contract w GiftSchema Text ()
+give amount = do
+    let ada = amount * 1000000
+        tx = mustPayToOtherScript valHash (Datum $ PlutusTx.toBuiltinData ()) $ Ada.lovelaceValueOf ada
+    ledgerTx <- submitTx tx
+    void $ awaitTxConfirmed $ txId ledgerTx
+    logInfo @String $ printf "made a gift of %d ada" ada
+
+endpointsHolder :: Contract () GiftSchema Text ()
+endpointsHolder = forever
+    $ handleError logError
+    $ awaitPromise give'
+    where
+        give' = endpoint @"give" give
 
 -- | Trace
 test :: IO ()
