@@ -16,6 +16,7 @@ module StableExchange.MyCurrency where
 import           Control.Monad          hiding (fmap)
 import           Data.Text              (Text)
 import           Data.Void              (Void)
+import qualified Data.Map               as Map
 import           Plutus.Contract        as Contract
 import           Plutus.Trace.Emulator  as Emulator
 import qualified PlutusTx
@@ -69,10 +70,10 @@ mkPolicy address r ctx =
         inputsInfo :: [TxInInfo]
         inputsInfo = txInfoInputs info
 
-        hasUTxO :: Bool
-        hasUTxO = any (\input -> txOutAddress (txInInfoResolved input) == address) inputsInfo
+        hasUTxOFromScript :: Bool
+        hasUTxOFromScript = any (\input -> txOutAddress (txInInfoResolved input) == address) inputsInfo
     in
-    traceIfFalse "Hasn't been deposited" hasUTxO &&
+    traceIfFalse "Hasn't been deposited" hasUTxOFromScript &&
     traceIfFalse "Wrong TokenName" (r == TokenName "MyCoin")
 
 policy :: Address -> Scripts.MintingPolicy
@@ -91,18 +92,29 @@ type MintSchema = Endpoint "mint" Integer
 
 mint :: Integer -> Contract w MintSchema Text ()
 mint amount = do
-    let tn = "MyCoin"
-        val = Value.singleton (mySymbol scrAddress) tn amount
-        ada = amount * 1000000
-        lookups = Constraints.otherScript validator <>
-                  Constraints.mintingPolicy (policy scrAddress)
-        tx      = mconcat [
-                    Constraints.mustPayToOtherScript valHash (Datum $ PlutusTx.toBuiltinData ()) $ Ada.lovelaceValueOf ada,
-                    Constraints.mustMintValueWithRedeemer (Redeemer $ PlutusTx.toBuiltinData (tn::TokenName))  val
-                ]
-    ledgerTx <- submitTxConstraintsWith @Void lookups tx
-    void $ awaitTxConfirmed $ txId ledgerTx
-    Contract.logInfo @String $ printf "forged %s" (show val)
+    utxos <- utxoAt scrAddress
+    case Map.toList utxos of
+        [(oref, o)] -> do
+            let tn = "MyCoin"
+                val = Value.singleton (mySymbol scrAddress) tn amount
+                ada = amount * 1000000
+                lookups =
+                        Constraints.unspentOutputs (Map.singleton oref o) <>
+                        Constraints.otherScript validator <>
+                        Constraints.mintingPolicy (policy scrAddress)
+                tx      = mconcat [
+                            Constraints.mustPayToOtherScript valHash (Datum $ PlutusTx.toBuiltinData ()) (Ada.lovelaceValueOf ada <> txOutValue (txOutTxOut o)),
+                            Constraints.mustMintValueWithRedeemer (Redeemer $ PlutusTx.toBuiltinData (tn::TokenName))  val,
+                            Constraints.mustSpendScriptOutput oref (Redeemer $ PlutusTx.toBuiltinData ())
+                        ]
+            ledgerTx <- submitTxConstraintsWith @Void lookups tx
+            void $ awaitTxConfirmed $ txId ledgerTx
+            Contract.logInfo @String $ printf "minted %s tokens" (show val)
+        _     -> do
+            let tx = Constraints.mustPayToTheScript () $ Ada.lovelaceValueOf 0
+            ledgerTx <- submitTxConstraints typedValidator tx
+            awaitTxConfirmed $ txId ledgerTx
+            logInfo @String $ "initialize script validator"
 
 endpoints :: Contract () MintSchema Text ()
 endpoints = forever
@@ -115,8 +127,10 @@ test :: IO ()
 test = runEmulatorTraceIO $ do
     h1 <- activateContractWallet (Wallet 1) endpoints
     h2 <- activateContractWallet (Wallet 2) endpoints
-    callEndpoint @"mint" h1 15
+    h3 <- activateContractWallet (Wallet 3) endpoints
+    callEndpoint @"mint" h1 0
+    void $ Emulator.waitNSlots 1
     callEndpoint @"mint" h2 10
     void $ Emulator.waitNSlots 1
-    callEndpoint @"mint" h1 5
+    callEndpoint @"mint" h3 5
     void $ Emulator.waitNSlots 1
