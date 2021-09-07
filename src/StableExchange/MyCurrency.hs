@@ -25,10 +25,10 @@ import           Ledger.Constraints     as Constraints
 import qualified Ledger.Typed.Scripts   as Scripts
 import           Ledger.Value           as Value
 import           Prelude                (IO, Show (..), String)
-import           GHC.Base               ((<>))
 import           Text.Printf            (printf)
 import           Wallet.Emulator.Wallet
 import           Ledger.Ada             as Ada
+import           GHC.Base               ((<>))
 
 -- | Onchain code
 
@@ -60,8 +60,8 @@ scrAddress = scriptAddress validator
 
 -- | Minting policy for MyCurrency
 {-# INLINABLE mkPolicy #-}
-mkPolicy :: TokenName -> ScriptContext -> Bool
-mkPolicy r ctx =
+mkPolicy :: Address -> TokenName -> ScriptContext -> Bool
+mkPolicy address r ctx =
     let
         info :: TxInfo
         info = scriptContextTxInfo ctx
@@ -69,17 +69,20 @@ mkPolicy r ctx =
         inputsInfo :: [TxInInfo]
         inputsInfo = txInfoInputs info
 
-        adaHolder :: Maybe TxInInfo
-        adaHolder = Just (PlutusTx.Prelude.head [ input | input <- inputsInfo, txOutAddress (txInInfoResolved input) == scrAddress ])
-    in 
-    traceIfFalse "Wrong TokenName" (r == TokenName "MyCoin") &&
-    traceIfFalse "Hasn't been deposited" (isJust adaHolder)
+        hasUTxO :: Bool
+        hasUTxO = any (\input -> txOutAddress (txInInfoResolved input) == address) inputsInfo
+    in
+    traceIfFalse "Hasn't been deposited" hasUTxO &&
+    traceIfFalse "Wrong TokenName" (r == TokenName "MyCoin")
 
-policy :: Scripts.MintingPolicy 
-policy = mkMintingPolicyScript $$(PlutusTx.compile [|| Scripts.wrapMintingPolicy mkPolicy ||])
+policy :: Address -> Scripts.MintingPolicy
+policy address = mkMintingPolicyScript $
+    $$(PlutusTx.compile [|| Scripts.wrapMintingPolicy . mkPolicy ||])
+    `PlutusTx.applyCode`
+    PlutusTx.liftCode address
 
-mySymbol :: CurrencySymbol
-mySymbol = scriptCurrencySymbol policy
+mySymbol :: Address -> CurrencySymbol
+mySymbol = scriptCurrencySymbol . policy
 
 -- | Offchain code
 
@@ -89,9 +92,14 @@ type MintSchema = Endpoint "mint" Integer
 mint :: Integer -> Contract w MintSchema Text ()
 mint amount = do
     let tn = "MyCoin"
-        val = Value.singleton mySymbol tn amount
-        lookups = Constraints.mintingPolicy policy <> Constraints.otherScript validator
-        tx      = Constraints.mustMintValueWithRedeemer (Redeemer $ PlutusTx.toBuiltinData (tn::TokenName))  val
+        val = Value.singleton (mySymbol scrAddress) tn amount
+        ada = amount * 1000000
+        lookups = Constraints.otherScript validator <>
+                  Constraints.mintingPolicy (policy scrAddress)
+        tx      = mconcat [
+                    Constraints.mustPayToOtherScript valHash (Datum $ PlutusTx.toBuiltinData ()) $ Ada.lovelaceValueOf ada,
+                    Constraints.mustMintValueWithRedeemer (Redeemer $ PlutusTx.toBuiltinData (tn::TokenName))  val
+                ]
     ledgerTx <- submitTxConstraintsWith @Void lookups tx
     void $ awaitTxConfirmed $ txId ledgerTx
     Contract.logInfo @String $ printf "forged %s" (show val)
@@ -102,25 +110,6 @@ endpoints = forever
         $ awaitPromise mint'
     where mint' = endpoint @"mint" mint
 
-
-type GiftSchema =
-    Endpoint "give" Integer
-
-give :: Integer -> Contract w GiftSchema Text ()
-give amount = do
-    let ada = amount * 1000000
-        tx = mustPayToOtherScript valHash (Datum $ PlutusTx.toBuiltinData ()) $ Ada.lovelaceValueOf ada
-    ledgerTx <- submitTx tx
-    void $ awaitTxConfirmed $ txId ledgerTx
-    logInfo @String $ printf "made a gift of %d ada" ada
-
-endpointsHolder :: Contract () GiftSchema Text ()
-endpointsHolder = forever
-    $ handleError logError
-    $ awaitPromise give'
-    where
-        give' = endpoint @"give" give
-
 -- | Trace
 test :: IO ()
 test = runEmulatorTraceIO $ do
@@ -128,9 +117,6 @@ test = runEmulatorTraceIO $ do
     h2 <- activateContractWallet (Wallet 2) endpoints
     callEndpoint @"mint" h1 15
     callEndpoint @"mint" h2 10
-    void $ Emulator.waitNSlots 1
-    hld1 <- activateContractWallet (Wallet 1) endpointsHolder
-    callEndpoint @"give" hld1 20
     void $ Emulator.waitNSlots 1
     callEndpoint @"mint" h1 5
     void $ Emulator.waitNSlots 1
