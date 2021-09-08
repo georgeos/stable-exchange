@@ -14,9 +14,11 @@
 module StableExchange.MyCurrency where
 
 import           Control.Monad          hiding (fmap)
+import           Data.Aeson             (FromJSON, ToJSON)
 import           Data.Text              (Text)
 import           Data.Void              (Void)
 import qualified Data.Map               as Map
+import           GHC.Generics           (Generic)
 import           Plutus.Contract        as Contract
 import           Plutus.Trace.Emulator  as Emulator
 import qualified PlutusTx
@@ -40,8 +42,8 @@ data HolderRedeemer = Redeem | Deposit
 PlutusTx.unstableMakeIsData ''HolderRedeemer
 
 {-# INLINABLE mkValidator #-}
-mkValidator :: () -> HolderRedeemer -> ScriptContext -> Bool
-mkValidator _ r ctx = 
+mkValidator :: PubKeyHash -> () -> HolderRedeemer -> ScriptContext -> Bool
+mkValidator pkh _ r ctx = 
     case r of
         Deposit -> traceIfFalse "Wrong amount to mint" paid
             where
@@ -57,28 +59,28 @@ mkValidator _ r ctx =
 
                 paid :: Bool
                 paid = outputValue `gt` inputValue
-        Redeem ->   traceIfFalse "Wrong signature" True
+        Redeem ->   traceIfFalse "Wrong signature" $ txSignedBy (scriptContextTxInfo ctx) pkh
 
 data Holder
 instance Scripts.ValidatorTypes Holder where
     type instance DatumType Holder = ()
     type instance RedeemerType Holder = HolderRedeemer
 
-typedValidator :: Scripts.TypedValidator Holder
-typedValidator = Scripts.mkTypedValidator @Holder
-        $$(PlutusTx.compile [|| mkValidator ||])
+typedValidator :: PubKeyHash -> Scripts.TypedValidator Holder
+typedValidator pkh = Scripts.mkTypedValidator @Holder
+        ($$(PlutusTx.compile [|| mkValidator ||]) `PlutusTx.applyCode` PlutusTx.liftCode pkh)
         $$(PlutusTx.compile [|| wrap ||])
     where
         wrap = Scripts.wrapValidator @() @HolderRedeemer
 
-validator :: Validator
-validator = Scripts.validatorScript typedValidator
+validator :: PubKeyHash -> Validator
+validator = Scripts.validatorScript . typedValidator
 
-valHash :: Ledger.ValidatorHash
-valHash = Scripts.validatorHash typedValidator
+valHash :: PubKeyHash -> Ledger.ValidatorHash
+valHash = Scripts.validatorHash . typedValidator
 
-scrAddress :: Ledger.Address
-scrAddress = scriptAddress validator
+scrAddress :: PubKeyHash -> Ledger.Address
+scrAddress = scriptAddress . validator
 
 -- | Minting policy for MyCurrency
 {-# INLINABLE mkPolicy #-}
@@ -109,46 +111,52 @@ mySymbol = scriptCurrencySymbol . policy
 -- | Offchain code
 
 -- | Endpoint to mint
+data MintParams = MintParams
+    { mpPubKeyHash:: !PubKeyHash
+    , mpAmount    :: !Integer
+    } deriving (Generic, ToJSON, FromJSON)
+
 type MintSchema =
-        Endpoint "mint" Integer
+        Endpoint "mint" MintParams
     .\/ Endpoint "redeem" ()
 
-mint :: Integer -> Contract w MintSchema Text ()
-mint amount = do
-    utxos <- utxoAt scrAddress
+mint :: MintParams -> Contract w MintSchema Text ()
+mint mp = do
+    utxos <- utxoAt $ scrAddress (mpPubKeyHash mp)
     case Map.toList utxos of
         [(oref, o)] -> do
             let tn = "MyCoin"
-                val = Value.singleton (mySymbol scrAddress) tn amount
-                ada = amount * 1000000
+                val = Value.singleton (mySymbol $ scrAddress $ mpPubKeyHash mp) tn $ mpAmount mp
+                ada = mpAmount mp * 1000000
                 lookups =
                         Constraints.unspentOutputs (Map.singleton oref o) <>
-                        Constraints.otherScript validator <>
-                        Constraints.mintingPolicy (policy scrAddress)
+                        Constraints.otherScript (validator $ mpPubKeyHash mp) <>
+                        Constraints.mintingPolicy (policy $ scrAddress $ mpPubKeyHash mp)
                 tx      = mconcat [
-                            Constraints.mustPayToOtherScript valHash (Datum $ PlutusTx.toBuiltinData ()) (Ada.lovelaceValueOf ada <> txOutValue (txOutTxOut o)),
+                            Constraints.mustPayToOtherScript (valHash $ mpPubKeyHash mp) (Datum $ PlutusTx.toBuiltinData ()) (Ada.lovelaceValueOf ada <> txOutValue (txOutTxOut o)),
                             Constraints.mustMintValueWithRedeemer (Redeemer $ PlutusTx.toBuiltinData (tn::TokenName))  val,
                             Constraints.mustSpendScriptOutput oref (Redeemer $ PlutusTx.toBuiltinData Deposit)
                         ]
             ledgerTx <- submitTxConstraintsWith @Void lookups tx
-            void $ awaitTxConfirmed $ txId ledgerTx
+            awaitTxConfirmed $ txId ledgerTx
             Contract.logInfo @String $ printf "minted %s tokens" (show val)
         _     -> do
             let tx = Constraints.mustPayToTheScript () $ Ada.lovelaceValueOf 0
-            ledgerTx <- submitTxConstraints typedValidator tx
+            ledgerTx <- submitTxConstraints (typedValidator $ mpPubKeyHash mp) tx
             awaitTxConfirmed $ txId ledgerTx
             logInfo @String $ "initialize script validator"
 
 redeem :: Contract w MintSchema Text ()
 redeem = do
-    utxos <- utxoAt scrAddress
+    pkh   <- pubKeyHash <$> Contract.ownPubKey
+    utxos <- utxoAt $ scrAddress pkh
     let orefs   = fst <$> Map.toList utxos
         lookups = Constraints.unspentOutputs utxos      <>
-                  Constraints.otherScript validator
+                  Constraints.otherScript (validator pkh)
         tx :: TxConstraints Void Void
         tx      = mconcat [mustSpendScriptOutput oref $ Redeemer $ PlutusTx.toBuiltinData Redeem | oref <- orefs]
     ledgerTx <- submitTxConstraintsWith @Void lookups tx
-    void $ awaitTxConfirmed $ txId ledgerTx
+    awaitTxConfirmed $ txId ledgerTx
     logInfo @String $ "redeemed"
 
 endpoints :: Contract () MintSchema Text ()
@@ -166,11 +174,12 @@ test = runEmulatorTraceIO $ do
     h1 <- activateContractWallet (Wallet 1) endpoints
     h2 <- activateContractWallet (Wallet 2) endpoints
     h3 <- activateContractWallet (Wallet 3) endpoints
-    callEndpoint @"mint" h1 0
+    let pkh1      = pubKeyHash $ walletPubKey $ Wallet 1
+    callEndpoint @"mint" h1 MintParams{ mpPubKeyHash = pkh1, mpAmount = 0 }
     void $ Emulator.waitNSlots 1
-    callEndpoint @"mint" h2 10
+    callEndpoint @"mint" h2 MintParams{ mpPubKeyHash = pkh1, mpAmount = 10 }
     void $ Emulator.waitNSlots 1
-    callEndpoint @"mint" h3 15
+    callEndpoint @"mint" h3 MintParams{ mpPubKeyHash = pkh1, mpAmount = 15 }
     void $ Emulator.waitNSlots 1
     callEndpoint @"redeem" h1 ()
     void $ Emulator.waitNSlots 1
